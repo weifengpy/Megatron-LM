@@ -1108,15 +1108,21 @@ def validate_args(args, defaults={}):
         assert args.flex_shard_no_sync or args.flex_shard_reshard_after_backward, \
             '--flex-shard-no-reshard-after-backward requires --flex-shard-no-sync'
 
-        # FlexShard all-gathers parameters in their own dtype; it has no FP8 or FP4 path yet,
-        # with any TransformerEngine version.
+        # With the blockwise recipe, FlexShard keeps bf16 shards and all-gathers
+        # TransformerEngine's 128 x 128 blockwise FP8 weights itself, so the model keeps bf16
+        # parameters (fp8_param stays off). It has no FP8 path for other recipes yet.
+        args.flex_shard_fp8_param_gather = False
         if args.fp8_param_gather:
             args.fp8_param_gather = False
-            warn_rank_0(
-                '--use-flex-shard does not support --fp8-param-gather yet; FlexShard will '
-                'all-gather bf16 parameters instead, turning off fp8_param_gather',
-                args.rank,
-            )
+            if args.fp8_recipe == 'blockwise':
+                args.flex_shard_fp8_param_gather = True
+            else:
+                warn_rank_0(
+                    '--use-flex-shard supports --fp8-param-gather only with --fp8-recipe '
+                    'blockwise; FlexShard will all-gather bf16 parameters instead, turning off '
+                    'fp8_param_gather',
+                    args.rank,
+                )
         if args.fp4_param_gather:
             args.fp4_param_gather = False
             warn_rank_0(

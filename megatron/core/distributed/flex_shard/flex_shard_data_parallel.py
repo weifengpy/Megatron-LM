@@ -10,6 +10,7 @@ from torch.distributed import ProcessGroup
 
 try:
     from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
+    from flex_shard.custom_placements import Fp8BucketedBlockShard, MixedBucketPlacement
     from flex_shard.custom_placements.shard import per_param_placements
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -25,6 +26,7 @@ from ...transformer.transformer_config import TransformerConfig
 from ...transformer.transformer_layer import TransformerLayer
 from ...utils import log_single_rank
 from ..data_parallel_base import _BaseDataParallel
+from . import te_fp8
 from .flex_shard_data_parallel_config import FlexShardDataParallelConfig
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,12 @@ class FlexShardDataParallel(_BaseDataParallel):
     weights on the first and last stages are separate copies, which finalize_model_grads
     all-reduces over the embedding group on the local shards; both stages shard them
     identically.
+
+    With FP8 parameter all-gather (``ddp_config.fp8_param_gather``, TransformerEngine's blockwise
+    recipe), the weights of TransformerEngine's linear layers keep bf16 local shards but
+    all-gather in 128 x 128 blockwise FP8, quantized by TransformerEngine's own weight quantizer,
+    and their layers receive the gathered ``Float8BlockwiseQTensor``; the rest of each bucket
+    shares that collective (te_fp8.py).
 
     Args:
         config: Transformer config object.
@@ -191,10 +199,25 @@ class FlexShardDataParallel(_BaseDataParallel):
         # Passed only where needed, so FlexShard without fusion still works with a flex_shard
         # that predates the hooks.
         main_grad_hooks = dict(
-            pre_backward_hook=self._alias_main_grads, post_reduce_hook=self._drop_main_grads
+            pre_backward_hook=self._alias_main_grads, post_reduce_hook=self._after_reduce
         )
         params = dict(self.module.named_parameters())
         is_expert = [_is_expert_param(params[fqns[0]]) for fqns in bucket_fqns]
+        # With FP8 parameter all-gather, TransformerEngine's blockwise FP8 weights all-gather in
+        # FP8 (te_fp8.py), and the rest of their bucket shares that collective.
+        fp8_fqns: Set[str] = set()
+        self._te_fp8 = None
+        if ddp_config.fp8_param_gather:
+            from megatron.core.fp8_utils import get_fp8_recipe
+
+            self._te_fp8 = te_fp8.TEBlockwiseFp8Weights(get_fp8_recipe(config))
+            fp8_fqns = {
+                f"{name}.{param_name}" if name else param_name
+                for name, submodule in self.module.named_modules()
+                for param_name, param in submodule.named_parameters(recurse=False)
+                if te_fp8.is_blockwise_fp8_weight(submodule, param_name, param)
+            }
+        has_fp8 = [any(fqn in fp8_fqns for fqn in fqns) for fqns in bucket_fqns]
         # With the EP overlap schedule, a TransformerLayer's buckets (its dense parameters and its
         # experts) finish from the schedule's per-layer post-backward hook (finish_layer_backward),
         # after the layer's last backward step or its backward_dw(), so the reduce-scatters in
@@ -221,7 +244,9 @@ class FlexShardDataParallel(_BaseDataParallel):
         self.buckets = [
             BucketSpec(
                 fqns,
-                placement_fn=per_param_placements,
+                placement_fn=(
+                    self._fp8_placement_fn(fp8_fqns) if has_fp8[i] else per_param_placements
+                ),
                 mesh=self.expert_device_mesh if is_expert[i] else self.device_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=(
@@ -231,6 +256,8 @@ class FlexShardDataParallel(_BaseDataParallel):
                 ),
                 **self._gradient_reduction(config, is_expert[i]),
                 **(main_grad_hooks if uses_main_grad[i] else {}),
+                # FP8 weights also drop the column-wise data derived for backward (te_fp8.py).
+                **(dict(post_reduce_hook=self._after_reduce) if has_fp8[i] else {}),
                 **(dict(defer_post_backward=True) if deferred[i] else {}),
             )
             for i, fqns in enumerate(bucket_fqns)
@@ -267,6 +294,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"reshard_after_backward={ddp_config.reshard_after_backward}, "
             f"main_grad buckets={sum(uses_main_grad)}, "
             f"deferred buckets={sum(deferred)}, "
+            f"fp8 weights={len(fp8_fqns)}, "
             f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )
@@ -358,10 +386,33 @@ class FlexShardDataParallel(_BaseDataParallel):
         self.module.finish_deferred_backward(self.module.get_parameter(fqn))
 
     @staticmethod
-    def _drop_main_grads(named_params: List[Tuple[str, torch.nn.Parameter]]) -> None:
-        """FlexShard post-reduce hook: drop main_grad once the gradient it aliases is gone."""
+    def _after_reduce(named_params: List[Tuple[str, torch.nn.Parameter]]) -> None:
+        """FlexShard post-reduce hook: drop main_grad once the gradient it aliases is gone, and
+        the column-wise data TransformerEngine derived from gathered FP8 weights."""
         for _, param in named_params:
             vars(param).pop("main_grad", None)
+            te_fp8.drop_columnwise(param)
+
+    def _fp8_placement_fn(self, fp8_fqns: Set[str]):
+        """Placements for a bucket with TransformerEngine blockwise FP8 weights: those
+        all-gather in FP8 (flex_shard's Fp8BucketedBlockShard with TransformerEngine's
+        quantizer), the rest Shard(0), all in one collective (MixedBucketPlacement)."""
+
+        def placement_fn(named_params, mesh):
+            fp8 = Fp8BucketedBlockShard(
+                world_size=mesh.size(),
+                weight_factory=self._te_fp8.weight_factory,
+                block_size=te_fp8.BLOCK_SIZE,
+                quantizer=self._te_fp8,
+            )
+            fqns = [fqn for fqn, _ in named_params]
+            if all(fqn in fp8_fqns for fqn in fqns):
+                return {fqn: (fp8,) for fqn in fqns}
+            mixed = MixedBucketPlacement({})
+            fp8 = mixed.fp8_bucketed_block_shard(fp8)
+            return {fqn: (fp8,) if fqn in fp8_fqns else (mixed.shard0,) for fqn in fqns}
+
+        return placement_fn
 
     def _build_bucket_fqns(self, tied: Optional[Tuple[str, str]]) -> List[List[str]]:
         """Group parameter FQNs into buckets in forward (module registration) order."""
